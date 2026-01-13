@@ -10,7 +10,7 @@ st.title("🎨 AI图片风格提取与批量生成工具")
 # --- 侧边栏：设置 ---
 with st.sidebar:
     st.header("🔑 设置")
-    # 自动去空格
+    # 自动去空格，防止 401 错误
     raw_token = st.text_input("输入 Replicate API Token", type="password", help="以 r8_ 开头")
     api_token = raw_token.strip() if raw_token else None
     
@@ -18,18 +18,13 @@ with st.sidebar:
         st.error("⚠️ Token 格式看起来不对，必须以 r8_ 开头")
 
     st.header("⚙️ 生成参数")
-    # 调整为更适合新手理解的描述
-    strength = st.slider("风格影响力 (Strength)", 0.1, 0.9, 0.6, help="数字越大，生成的图越像参考风格；数字越小，越像原图")
-    num_steps = st.slider("生成质量 (步数)", 20, 50, 30)
+    strength = st.slider("风格影响力", 0.1, 0.9, 0.65, help="数值越大，风格越浓烈；数值越小，越保留原图形状")
+    num_steps = st.slider("生成质量", 20, 50, 30)
 
 # --- 核心函数：封装调用过程 ---
 def run_replicate(model_version, input_data, token):
-    try:
-        client = replicate.Client(api_token=token)
-        # 这里使用最新的运行方式
-        return client.run(model_version, input=input_data)
-    except Exception as e:
-        raise e
+    client = replicate.Client(api_token=token)
+    return client.run(model_version, input=input_data)
 
 # --- 步骤 1: 上传与分析 ---
 st.subheader("1. 上传参考风格图")
@@ -39,13 +34,13 @@ if ref_file and api_token:
     st.image(ref_file, caption="参考图", width=250)
     
     if st.button("🔍 分析风格提示词"):
-        with st.spinner("正在使用 img2prompt 模型分析风格..."):
+        with st.spinner("AI正在分析图片风格 (CLIP Interrogator)..."):
             try:
-                # 【修改点】更换为更稳定的 methexis-inc/img2prompt 模型
-                # 这个模型专门用于将图片反推为 Stable Diffusion 提示词
+                # 【关键修复】换回 CLIP Interrogator，并使用最新的 Verified 版本 ID
+                # 这是一个目前确认可用的最新版本
                 output = run_replicate(
-                    "methexis-inc/img2prompt:50adaf2d3ad20a6f911a8a9e3ccf777b263b8596fbd2c8fc26e8888f8a7edbb5",
-                    {"image": ref_file},
+                    "pharmapsychotic/clip-interrogator:8151e1c9f47e696fa316146a2e35812ccf79cfc9eba05b11c7f450155102af70",
+                    {"image": ref_file, "mode": "fast"}, # 使用 fast 模式更省钱
                     api_token
                 )
                 st.session_state['style_prompt'] = output
@@ -56,6 +51,7 @@ if ref_file and api_token:
 # 显示提示词
 if 'style_prompt' in st.session_state:
     st.markdown("### 📝 风格提示词")
+    # 允许用户修改
     style_prompt = st.text_area("提示词", st.session_state['style_prompt'], height=80)
 else:
     style_prompt = ""
@@ -76,17 +72,16 @@ if uploaded_files and style_prompt and api_token:
             with st.spinner(f"正在生成第 {idx+1} 张..."):
                 try:
                     # 组合提示词
-                    final_prompt = f"{style_prompt}, high quality, 8k"
+                    final_prompt = f"{style_prompt}, high quality, 8k, detailed"
                     
-                    # 【修改点】使用 SDXL Base 1.0 的官方稳定版本
+                    # 使用 SDXL 官方稳定版
                     output = run_replicate(
                         "stability-ai/sdxl:39ed52f2a78e934b3ba6e399ea1a963986eeac40ef080b697b0803a6466b717c",
                         {
                             "image": img_file,
                             "prompt": final_prompt,
-                            "prompt_strength": 1.0 - strength, # 自动转换参数
-                            "num_inference_steps": num_steps,
-                            "guidance_scale": 7.5
+                            "prompt_strength": 1.0 - strength,
+                            "num_inference_steps": num_steps
                         },
                         api_token
                     )
@@ -97,7 +92,7 @@ if uploaded_files and style_prompt and api_token:
                         with col1:
                             st.image(img_file, caption="原图", width=200)
                         with col2:
-                            # 兼容不同模型返回格式
+                            # 处理返回格式
                             img_url = output[0] if isinstance(output, list) else output
                             st.image(img_url, caption="AI生成图", width=200)
                             st.markdown(f"[下载大图]({img_url})")
