@@ -7,187 +7,254 @@ import io
 from replicate.exceptions import ReplicateError
 
 # --- 页面基础设置 ---
-st.set_page_config(page_title="AI全能风格迁移工作台", layout="wide")
-st.title("🛡️ AI全能风格迁移 (自动更新版)")
-st.markdown("ℹ️ **说明**：系统现在会自动抓取 AI 模型的最新版本号，彻底解决版本过期 (422) 问题。")
+st.set_page_config(page_title="AI风格重绘工作台 Pro", layout="wide")
+st.title("🎨 AI风格重绘工作台 Pro (二次元转3D/风格统一)")
 
-# --- 侧边栏 ---
+# --- 侧边栏：全局设置 ---
 with st.sidebar:
-    st.header("🔑 核心设置")
+    st.header("🔑 密钥设置")
     raw_token = st.text_input("Replicate API Token", type="password", help="r8_开头")
     api_token = raw_token.strip() if raw_token else None
+
+    st.divider()
     
-    st.header("⚙️ 参数")
-    strength = st.slider("风格重塑程度", 0.1, 1.0, 0.75)
-    num_steps = st.slider("生成质量(步数)", 20, 50, 30)
+    st.header("🎮 风格控制中枢")
+    # 关键参数：重绘幅度
+    strength = st.slider(
+        "风格重塑幅度 (Prompt Strength)", 
+        0.1, 1.0, 0.75, 
+        help="核心参数！\n0.3-0.5: 微调，几乎不变\n0.6-0.8: 风格大变但保留构图 (推荐)\n0.9-1.0: 完全重画"
+    )
+    
+    # 负面提示词：用于去除原图风格
+    default_neg = "anime, cartoon, drawing, sketch, 2d, illustration, low quality, bad anatomy, blur"
+    negative_prompt = st.text_area("负面提示词 (去除的元素)", value=default_neg, height=100, help="想把二次元转3D，这里务必加上 anime, 2d")
+    
+    st.info("💡 提示：如果生成的图变化不大，请调高【风格重塑幅度】到 0.8 以上。")
 
-# --- 核心工具函数：动态获取版本 + 智能重试 ---
-def get_latest_version(model_name, token):
-    """
-    动态获取模型的最新版本ID，防止硬编码过期
-    """
-    client = replicate.Client(api_token=token)
-    model = client.models.get(model_name)
-    return model.latest_version
-
+# --- 核心工具函数 ---
 def run_replicate_dynamic(model_name, input_data, token):
-    """
-    自动查找最新版并运行，带防限流重试机制
-    """
+    """自动获取最新版本并运行，带防限流和NSFW捕获"""
     client = replicate.Client(api_token=token)
-    max_retries = 10
     
-    # 第一步：获取最新版本 (只会执行一次，不消耗预测额度)
+    # 1. 动态获取最新版本
     try:
-        latest_version = get_latest_version(model_name, token)
+        model = client.models.get(model_name)
+        latest_version = model.latest_version
     except Exception as e:
-        st.error(f"❌ 无法找到模型 {model_name}，可能是Token无效或模型被下架。")
-        raise e
+        raise Exception(f"模型 {model_name} 连接失败: {e}")
 
-    # 第二步：执行预测 (带重试)
+    # 2. 运行预测 (带重试)
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            # 使用 create 方法创建预测
             prediction = client.predictions.create(version=latest_version, input=input_data)
-            
-            # 等待结果
             prediction.wait()
             
             if prediction.status == "succeeded":
                 return prediction.output
-            else:
-                raise Exception(f"生成失败，状态: {prediction.status}, 错误: {prediction.error}")
-
+            elif prediction.status == "failed":
+                # 捕获 NSFW 错误
+                if "NSFW" in str(prediction.error):
+                    raise Exception("NSFW_ERROR")
+                raise Exception(f"生成失败: {prediction.error}")
+                
         except Exception as e:
-            error_str = str(e)
+            if str(e) == "NSFW_ERROR":
+                raise e # 直接抛出给上层处理
             
-            # 遇到限流 (429) -> 等待并重试
-            if "429" in error_str or "throttled" in error_str:
-                wait_time = 15 + (attempt * 5)
-                st.toast(f"⏳ 触发限流保护，正在冷却 {wait_time} 秒...", icon="🛡️")
+            if "429" in str(e) or "throttled" in str(e):
+                wait_time = 10 + (attempt * 5)
+                st.toast(f"⏳ 限流保护中，冷却 {wait_time} 秒...", icon="🛡️")
                 time.sleep(wait_time)
-                continue 
+                continue
+            raise e
             
-            # 其他错误 -> 抛出
-            else:
-                raise e
-    
-    raise Exception("重试多次失败，请检查账户余额。")
+    raise Exception("重试超时")
 
 def download_image(url):
     response = requests.get(url)
     return response.content
 
-# --- 1. 参考风格 ---
-st.header("1️⃣ 参考风格提取")
-ref_file = st.file_uploader("上传风格参考图", type=['png', 'jpg', 'jpeg'], key="ref")
+# --- 布局：左右分栏 ---
+left_col, right_col = st.columns([1, 1.5], gap="large")
 
-if ref_file and api_token:
-    st.image(ref_file, width=200)
-    if st.button("🔍 分析风格"):
-        with st.spinner("正在获取最新模型并分析..."):
-            try:
-                # 动态调用 CLIP Interrogator
-                output = run_replicate_dynamic(
-                    "pharmapsychotic/clip-interrogator", # 只写模型名，不写ID
-                    {"image": ref_file, "mode": "fast"},
-                    api_token
-                )
-                st.session_state['style_tags'] = output
-                st.success("分析完成！")
-            except Exception as e:
-                st.error(f"分析失败: {e}")
-
-if 'style_tags' in st.session_state:
-    style_prompt = st.text_area("风格提示词", st.session_state['style_tags'], height=100)
-else:
-    style_prompt = ""
-
-st.markdown("---")
-
-# --- 2. 批量处理 ---
-st.header("2️⃣ 批量生成 (自动排队)")
-batch_files = st.file_uploader("上传批量图片", accept_multiple_files=True, key="batch")
-
-if batch_files and style_prompt and api_token:
-    if st.button(f"🚀 开始处理 ({len(batch_files)} 张)"):
+# ================= 左侧：参考图 (风格源) =================
+with left_col:
+    st.header("1️⃣ 参考图 (Style Source)")
+    st.caption("上传你想模仿的风格图片（如：游戏CG、电影剧照）")
+    
+    ref_file = st.file_uploader("上传参考图", type=['png', 'jpg', 'jpeg'], key="ref")
+    
+    style_tags = ""
+    
+    if ref_file:
+        st.image(ref_file, use_container_width=True)
         
-        zip_buffer = io.BytesIO()
-        generated_count = 0
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results_col = st.container()
+        if api_token:
+            if st.button("🔍 分析参考图风格", type="primary"):
+                with st.spinner("正在提取风格关键词..."):
+                    try:
+                        # 使用 CLIP Interrogator 提取风格
+                        output = run_replicate_dynamic(
+                            "pharmapsychotic/clip-interrogator",
+                            {"image": ref_file, "mode": "fast"},
+                            api_token
+                        )
+                        st.session_state['style_prompt'] = output
+                    except Exception as e:
+                        st.error(f"分析失败: {e}")
 
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+    # 风格提示词展示区
+    if 'style_prompt' in st.session_state:
+        st.markdown("##### 🎯 提取到的风格词:")
+        style_prompt = st.text_area(
+            "风格提示词 (会自动应用到右侧)", 
+            value=st.session_state['style_prompt'], 
+            height=120,
+            key="style_input"
+        )
+    else:
+        style_prompt = ""
+
+
+# ================= 右侧：批量处理 (内容源) =================
+with right_col:
+    st.header("2️⃣ 批量处理 (Content Source)")
+    st.caption("上传需要转绘的图片（如：二次元线稿、草图）")
+    
+    batch_files = st.file_uploader("批量上传图片", accept_multiple_files=True, key="batch")
+    
+    # 状态存储
+    if 'batch_data' not in st.session_state:
+        st.session_state['batch_data'] = {} # 用于存每张图的提示词和结果
+
+    # --- 步骤 A: 批量识别内容 ---
+    if batch_files and api_token:
+        if st.button("👁️ 第一步：识别所有图片内容 (保留构图)"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            for idx, img_file in enumerate(batch_files):
-                # -------------------------------------------------
-                # 步骤 A: 分析内容
-                # -------------------------------------------------
-                status_text.info(f"[{idx+1}/{len(batch_files)}] 👁️ 正在识别内容: {img_file.name}")
+            for i, file in enumerate(batch_files):
+                status_text.info(f"正在识别第 {i+1} 张: {file.name}...")
                 try:
-                    # 动态调用 BLIP
-                    content_output = run_replicate_dynamic(
-                        "salesforce/blip", # 只写模型名
-                        {"image": img_file, "task": "image_captioning"},
+                    # 使用 BLIP 识别画面内容 (它通常只描述内容，不带风格)
+                    content_desc = run_replicate_dynamic(
+                        "salesforce/blip",
+                        {"image": file, "task": "image_captioning"},
                         api_token
                     )
-                    content_desc = content_output.strip()
+                    # 清洗内容描述，去掉 potential style words
+                    content_clean = content_desc.replace("cartoon", "").replace("anime", "").strip()
+                    
+                    st.session_state['batch_data'][file.name] = {
+                        "content": content_clean,
+                        "status": "ready"
+                    }
                 except Exception as e:
-                    st.warning(f"内容识别跳过: {e}")
-                    content_desc = "image"
+                    st.error(f"{file.name} 识别失败: {e}")
                 
-                # -------------------------------------------------
-                # 步骤 B: 生成图片
-                # -------------------------------------------------
-                status_text.info(f"[{idx+1}/{len(batch_files)}] 🎨 正在绘制: {img_file.name}")
-                try:
-                    final_prompt = f"{style_prompt}, {content_desc}, high quality, 8k"
-                    
-                    # 动态调用 SDXL (使用官方 base 模型，最稳定)
-                    output_urls = run_replicate_dynamic(
-                        "stability-ai/sdxl", # 只写模型名，代码会自动找最新版ID
-                        {
-                            "image": img_file,
-                            "prompt": final_prompt,
-                            "prompt_strength": 1.0 - strength, 
-                            "num_inference_steps": num_steps,
-                            "guidance_scale": 7.5
-                        },
-                        api_token
-                    )
-                    
-                    # 保存
-                    img_data = download_image(output_urls[0])
-                    zip_file.writestr(f"AI_{img_file.name}", img_data)
-                    generated_count += 1
-                    
-                    with results_col:
-                        c1, c2 = st.columns(2)
-                        c1.image(img_file, width=150, caption="原图")
-                        c2.image(output_urls[0], width=150, caption="AI生成")
-                        st.divider()
+                progress_bar.progress((i + 1) / len(batch_files))
+            status_text.success("✅ 内容识别完成！请查看下方列表")
 
-                except Exception as e:
-                    st.error(f"❌ 生成失败 {img_file.name}: {e}")
+        st.divider()
 
-                # 更新进度
-                progress_bar.progress((idx + 1) / len(batch_files))
+        # --- 步骤 B: 列表展示与一键生成 ---
+        if batch_files:
+            # 只有当有风格词时才显示生成按钮
+            if style_prompt:
+                if st.button("🚀 第二步：一键统一风格并生成 (Style Transfer)"):
+                    if not st.session_state.get('batch_data'):
+                        st.warning("请先点击上方的【第一步：识别所有图片内容】")
+                    else:
+                        # 初始化下载包
+                        zip_buffer = io.BytesIO()
+                        has_results = False
+                        
+                        result_container = st.container()
+                        progress = st.progress(0)
+                        
+                        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                            
+                            for idx, file in enumerate(batch_files):
+                                file_data = st.session_state['batch_data'].get(file.name, {})
+                                content_txt = file_data.get("content", "original content")
+                                
+                                # === 核心逻辑：风格替换 ===
+                                # 最终提示词 = 参考图风格 + 批量图内容
+                                final_prompt = f"{style_prompt}, {content_txt}, best quality, 8k, masterpiece"
+                                
+                                try:
+                                    # 调用 SDXL
+                                    output = run_replicate_dynamic(
+                                        "stability-ai/sdxl",
+                                        {
+                                            "image": file,
+                                            "prompt": final_prompt,
+                                            "negative_prompt": negative_prompt, # 强力去除原风格
+                                            "prompt_strength": 1.0 - strength,  # 这里 Replicate 逻辑：0.2表示很像原图，0.8表示很像提示词
+                                            "num_inference_steps": 30,
+                                            "guidance_scale": 7.5
+                                        },
+                                        api_token
+                                    )
+                                    
+                                    # 存结果
+                                    img_url = output[0]
+                                    img_bytes = download_image(img_url)
+                                    zip_file.writestr(f"Styled_{file.name}", img_bytes)
+                                    
+                                    # 更新 session 状态用于展示
+                                    st.session_state['batch_data'][file.name]['result'] = img_url
+                                    st.session_state['batch_data'][file.name]['final_prompt'] = final_prompt
+                                    has_results = True
+                                    
+                                except Exception as e:
+                                    err_msg = str(e)
+                                    if "NSFW" in err_msg:
+                                        st.session_state['batch_data'][file.name]['error'] = "❌ 包含敏感内容 (NSFW)，已跳过"
+                                    else:
+                                        st.session_state['batch_data'][file.name]['error'] = f"生成失败: {err_msg}"
+                                
+                                progress.progress((idx + 1) / len(batch_files))
+                        
+                        if has_results:
+                            st.download_button(
+                                "📦 批量下载所有结果 (ZIP)",
+                                data=zip_buffer.getvalue(),
+                                file_name="style_transfer_results.zip",
+                                mime="application/zip",
+                                type="primary"
+                            )
 
-        status_text.success("✅ 全部任务处理完毕！")
-        
-        if generated_count > 0:
-            st.download_button(
-                "📦 下载全部结果 (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name="ai_style_transfer_final.zip",
-                mime="application/zip",
-                type="primary"
-            )
+            # --- 列表展示区域 ---
+            st.write("### 🖼️ 图片处理列表")
+            for file in batch_files:
+                data = st.session_state['batch_data'].get(file.name, {})
+                
+                with st.expander(f"图片: {file.name}", expanded=True):
+                    c1, c2, c3 = st.columns([1, 2, 1])
+                    
+                    # 第一列：原图
+                    with c1:
+                        st.image(file, caption="原图", width=150)
+                    
+                    # 第二列：提示词控制
+                    with c2:
+                        current_content = data.get("content", "等待识别...")
+                        # 预览最终组合
+                        preview_prompt = f"【风格】: {style_prompt[:50]}...\n【内容】: {current_content}"
+                        st.text_area("当前图片提示词预览", value=preview_prompt, height=100, disabled=True)
+                        
+                        if "error" in data:
+                            st.error(data["error"])
+                    
+                    # 第三列：结果图
+                    with c3:
+                        if "result" in data:
+                            st.image(data["result"], caption="风格化结果", width=150)
+                        else:
+                            st.markdown("*等待生成...*")
 
 elif not api_token:
-    st.info("👈 请输入 Token")
-
-elif not api_token:
-    st.info("👈 请输入 Token")
+    st.info("👈 请先在左侧输入 API Token")
