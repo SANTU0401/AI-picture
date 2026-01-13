@@ -55,7 +55,7 @@ def run_replicate_dynamic(model_name, input_data, token):
                 return prediction.output
             elif prediction.status == "failed":
                 # 捕获 NSFW 错误
-                if "NSFW" in str(prediction.error):
+                if prediction.error and "NSFW" in str(prediction.error):
                     raise Exception("NSFW_ERROR")
                 raise Exception(f"生成失败: {prediction.error}")
                 
@@ -63,7 +63,9 @@ def run_replicate_dynamic(model_name, input_data, token):
             if str(e) == "NSFW_ERROR":
                 raise e # 直接抛出给上层处理
             
-            if "429" in str(e) or "throttled" in str(e):
+            # 兼容不同类型的错误字符串转换
+            err_str = str(e)
+            if "429" in err_str or "throttled" in err_str:
                 wait_time = 10 + (attempt * 5)
                 st.toast(f"⏳ 限流保护中，冷却 {wait_time} 秒...", icon="🛡️")
                 time.sleep(wait_time)
@@ -211,7 +213,7 @@ with right_col:
                                     
                                 except Exception as e:
                                     err_msg = str(e)
-                                    if "NSFW" in err_msg:
+                                    if "NSFW_ERROR" in err_msg:
                                         st.session_state['batch_data'][file.name]['error'] = "❌ 包含敏感内容 (NSFW)，已跳过"
                                     else:
                                         st.session_state['batch_data'][file.name]['error'] = f"生成失败: {err_msg}"
@@ -256,5 +258,6 @@ with right_col:
                         else:
                             st.markdown("*等待生成...*")
 
-elif not api_token:
-    st.info("👈 请先在左侧输入 API Token")
+# --- 底部全局检查 (已修复: 使用 if 而不是 elif) ---
+if not api_token:
+    st.warning("👈 请先在左侧侧边栏输入 Replicate API Token 才能开始使用")
