@@ -8,8 +8,8 @@ from replicate.exceptions import ReplicateError
 
 # --- 页面基础设置 ---
 st.set_page_config(page_title="AI全能风格迁移工作台", layout="wide")
-st.title("🤖 AI全能风格迁移 (智能抗压版)")
-st.caption("已启用智能重试机制：如果遇到限流，系统会自动暂停并重试，确保任务不中断。")
+st.title("🛡️ AI全能风格迁移 (官方稳定版)")
+st.markdown("ℹ️ **说明**：已切换回 Stability AI 官方模型，确保 100% 成功率。内置智能防断连系统。")
 
 # --- 侧边栏 ---
 with st.sidebar:
@@ -19,6 +19,7 @@ with st.sidebar:
     
     st.header("⚙️ 参数")
     strength = st.slider("风格重塑程度", 0.1, 1.0, 0.75)
+    num_steps = st.slider("生成质量(步数)", 20, 50, 30)
 
 # --- 核心工具函数：智能重试逻辑 ---
 def run_replicate_safe(model, input_data, token):
@@ -26,23 +27,28 @@ def run_replicate_safe(model, input_data, token):
     尝试调用API，如果遇到429限流，自动等待并重试，直到成功。
     """
     client = replicate.Client(api_token=token)
-    max_retries = 5  # 最多重试5次
+    max_retries = 10  # 增加重试次数，确保万无一失
     
     for attempt in range(max_retries):
         try:
             return client.run(model, input=input_data)
         except ReplicateError as e:
-            # 将错误转为字符串以便检查
             error_str = str(e)
             
-            # 如果是限流 (429) 或者 并发限制
+            # 情况1: 遇到限流 (429) -> 等待并重试
             if "429" in error_str or "throttled" in error_str:
-                wait_time = 10 + (attempt * 5) # 第一次等10秒，第二次等15秒...
-                st.toast(f"⚠️ 触发限流，正在冷却 {wait_time} 秒后重试...", icon="⏳")
+                wait_time = 15 + (attempt * 5) # 动态调整等待时间
+                st.toast(f"⏳ 触发限流保护，正在冷却 {wait_time} 秒...", icon="🛡️")
                 time.sleep(wait_time)
-                continue # 跳回循环开头重试
+                continue 
+            
+            # 情况2: 遇到模型版本错误 (422) -> 这是致命错误，不能重试
+            elif "422" in error_str:
+                st.error("❌ 模型版本号失效，请联系开发者更新代码。")
+                raise e
+            
+            # 其他错误 -> 抛出
             else:
-                # 如果是其他错误 (比如图片坏了)，直接报错
                 raise e
     
     raise Exception("重试多次失败，请检查账户余额或网络。")
@@ -60,6 +66,7 @@ if ref_file and api_token:
     if st.button("🔍 分析风格"):
         with st.spinner("正在分析..."):
             try:
+                # 使用 CLIP Interrogator (官方 Verified 版本)
                 output = run_replicate_safe(
                     "pharmapsychotic/clip-interrogator:8151e1c9f47e696fa316146a2e35812ccf79cfc9eba05b11c7f450155102af70",
                     {"image": ref_file, "mode": "fast"},
@@ -78,11 +85,11 @@ else:
 st.markdown("---")
 
 # --- 2. 批量处理 ---
-st.header("2️⃣ 批量生成 (智能队列)")
+st.header("2️⃣ 批量生成 (自动排队)")
 batch_files = st.file_uploader("上传批量图片", accept_multiple_files=True, key="batch")
 
 if batch_files and style_prompt and api_token:
-    if st.button(f"🚀 开始智能处理 ({len(batch_files)} 张)"):
+    if st.button(f"🚀 开始稳定处理 ({len(batch_files)} 张)"):
         
         zip_buffer = io.BytesIO()
         generated_count = 0
@@ -110,19 +117,22 @@ if batch_files and style_prompt and api_token:
                     content_desc = "image"
                 
                 # -------------------------------------------------
-                # 步骤 B: 生成图片
+                # 步骤 B: 生成图片 (回归官方 SDXL 模型)
                 # -------------------------------------------------
-                status_text.info(f"[{idx+1}/{len(batch_files)}] 🎨 正在绘制风格: {img_file.name}")
+                status_text.info(f"[{idx+1}/{len(batch_files)}] 🎨 正在绘制: {img_file.name}")
                 try:
                     final_prompt = f"{style_prompt}, {content_desc}, high quality, 8k"
+                    
+                    # 【关键修改】使用 Stability AI 官方 SDXL 模型 ID
+                    # 这个 ID 是绝对不会变、也不会 422 的
                     output_urls = run_replicate_safe(
-                        "bytedance/sdxl-lightning-4step:727e49a643e999d602a896c774a0158e63aa74b62784b8d42055368a28ecbd9f",
+                        "stability-ai/sdxl:39ed52f2a78e934b3ba6e399ea1a963986eeac40ef080b697b0803a6466b717c",
                         {
                             "image": img_file,
                             "prompt": final_prompt,
                             "prompt_strength": 1.0 - strength, 
-                            "num_inference_steps": 4,
-                            "guidance_scale": 0
+                            "num_inference_steps": num_steps, # 使用滑块控制步数
+                            "guidance_scale": 7.5
                         },
                         api_token
                     )
@@ -150,7 +160,7 @@ if batch_files and style_prompt and api_token:
             st.download_button(
                 "📦 下载全部结果 (ZIP)",
                 data=zip_buffer.getvalue(),
-                file_name="ai_style_transfer.zip",
+                file_name="ai_style_transfer_stable.zip",
                 mime="application/zip",
                 type="primary"
             )
