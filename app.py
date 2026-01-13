@@ -10,24 +10,24 @@ st.title("🎨 AI图片风格提取与批量生成工具")
 # --- 侧边栏：设置 ---
 with st.sidebar:
     st.header("🔑 设置")
-    # 增加 .strip() 说明，防止用户不知道空格问题
+    # 自动去空格
     raw_token = st.text_input("输入 Replicate API Token", type="password", help="以 r8_ 开头")
-    # 强制清理 Token：去除前后空格、换行符
     api_token = raw_token.strip() if raw_token else None
     
     if api_token and not api_token.startswith("r8_"):
         st.error("⚠️ Token 格式看起来不对，必须以 r8_ 开头")
 
     st.header("⚙️ 生成参数")
-    strength = st.slider("风格重绘幅度 (Strength)", 0.1, 1.0, 0.75, help="推荐 0.7-0.8")
-    num_steps = st.slider("生成步数", 20, 50, 30)
+    # 调整为更适合新手理解的描述
+    strength = st.slider("风格影响力 (Strength)", 0.1, 0.9, 0.6, help="数字越大，生成的图越像参考风格；数字越小，越像原图")
+    num_steps = st.slider("生成质量 (步数)", 20, 50, 30)
 
-# --- 核心函数：封装调用过程，强制传递Token ---
-def run_replicate(model, input_data, token):
+# --- 核心函数：封装调用过程 ---
+def run_replicate(model_version, input_data, token):
     try:
-        # 显式创建一个客户端，确保使用的是用户输入的Token
         client = replicate.Client(api_token=token)
-        return client.run(model, input=input_data)
+        # 这里使用最新的运行方式
+        return client.run(model_version, input=input_data)
     except Exception as e:
         raise e
 
@@ -39,21 +39,19 @@ if ref_file and api_token:
     st.image(ref_file, caption="参考图", width=250)
     
     if st.button("🔍 分析风格提示词"):
-        if not api_token.startswith("r8_"):
-            st.error("请先在左侧填入正确的 Token (r8_开头)")
-        else:
-            with st.spinner("AI正在读取图片..."):
-                try:
-                    # 使用强力修正后的调用方式
-                    output = run_replicate(
-                        "pharmapsychotic/clip-interrogator:a24998d0ddb2eabd20197e9e38ef2049d59e99dd94ca9e87900408cb837130b0",
-                        {"image": ref_file, "mode": "fast"},
-                        api_token
-                    )
-                    st.session_state['style_prompt'] = output
-                    st.success("✅ 提取成功！")
-                except Exception as e:
-                    st.error(f"分析失败，错误详情: {str(e)}")
+        with st.spinner("正在使用 img2prompt 模型分析风格..."):
+            try:
+                # 【修改点】更换为更稳定的 methexis-inc/img2prompt 模型
+                # 这个模型专门用于将图片反推为 Stable Diffusion 提示词
+                output = run_replicate(
+                    "methexis-inc/img2prompt:50adaf2d3ad20a6f911a8a9e3ccf777b263b8596fbd2c8fc26e8888f8a7edbb5",
+                    {"image": ref_file},
+                    api_token
+                )
+                st.session_state['style_prompt'] = output
+                st.success("✅ 风格提取成功！")
+            except Exception as e:
+                st.error(f"分析失败: {str(e)}")
 
 # 显示提示词
 if 'style_prompt' in st.session_state:
@@ -77,16 +75,18 @@ if uploaded_files and style_prompt and api_token:
         for idx, img_file in enumerate(uploaded_files):
             with st.spinner(f"正在生成第 {idx+1} 张..."):
                 try:
-                    final_prompt = f"{style_prompt}, high quality, 4k"
+                    # 组合提示词
+                    final_prompt = f"{style_prompt}, high quality, 8k"
                     
-                    # 使用强力修正后的调用方式
+                    # 【修改点】使用 SDXL Base 1.0 的官方稳定版本
                     output = run_replicate(
                         "stability-ai/sdxl:39ed52f2a78e934b3ba6e399ea1a963986eeac40ef080b697b0803a6466b717c",
                         {
                             "image": img_file,
                             "prompt": final_prompt,
-                            "prompt_strength": 1.0 - strength,
-                            "num_inference_steps": num_steps
+                            "prompt_strength": 1.0 - strength, # 自动转换参数
+                            "num_inference_steps": num_steps,
+                            "guidance_scale": 7.5
                         },
                         api_token
                     )
@@ -97,8 +97,10 @@ if uploaded_files and style_prompt and api_token:
                         with col1:
                             st.image(img_file, caption="原图", width=200)
                         with col2:
-                            st.image(output[0], caption="AI生成图", width=200)
-                            st.markdown(f"[下载大图]({output[0]})")
+                            # 兼容不同模型返回格式
+                            img_url = output[0] if isinstance(output, list) else output
+                            st.image(img_url, caption="AI生成图", width=200)
+                            st.markdown(f"[下载大图]({img_url})")
                         st.markdown("---")
                         
                 except Exception as e:
