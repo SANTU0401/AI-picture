@@ -4,126 +4,122 @@ import time
 import requests
 import zipfile
 import io
+from replicate.exceptions import ReplicateError
 
 # --- 页面基础设置 ---
 st.set_page_config(page_title="AI全能风格迁移工作台", layout="wide")
-st.title("🎨 AI全能风格迁移工作台 (分析+替换+生成+打包)")
+st.title("🤖 AI全能风格迁移 (智能抗压版)")
+st.caption("已启用智能重试机制：如果遇到限流，系统会自动暂停并重试，确保任务不中断。")
 
-# --- 侧边栏：配置区 ---
+# --- 侧边栏 ---
 with st.sidebar:
     st.header("🔑 核心设置")
     raw_token = st.text_input("Replicate API Token", type="password", help="r8_开头")
     api_token = raw_token.strip() if raw_token else None
     
-    if api_token and not api_token.startswith("r8_"):
-        st.error("⚠️ Token 格式错误")
+    st.header("⚙️ 参数")
+    strength = st.slider("风格重塑程度", 0.1, 1.0, 0.75)
 
-    st.header("⚙️ 生成控制")
-    strength = st.slider("风格重塑程度", 0.1, 1.0, 0.75, help="1.0为完全重绘，0.5保留更多原图结构")
-    st.info("💡 逻辑说明：\n1. AI提取参考图的【风格】\n2. AI提取批量图的【内容】\n3. 两者融合生成新图")
-
-# --- 核心工具函数 ---
-def run_replicate(model, input_data, token):
+# --- 核心工具函数：智能重试逻辑 ---
+def run_replicate_safe(model, input_data, token):
+    """
+    尝试调用API，如果遇到429限流，自动等待并重试，直到成功。
+    """
     client = replicate.Client(api_token=token)
-    return client.run(model, input=input_data)
+    max_retries = 5  # 最多重试5次
+    
+    for attempt in range(max_retries):
+        try:
+            return client.run(model, input=input_data)
+        except ReplicateError as e:
+            # 将错误转为字符串以便检查
+            error_str = str(e)
+            
+            # 如果是限流 (429) 或者 并发限制
+            if "429" in error_str or "throttled" in error_str:
+                wait_time = 10 + (attempt * 5) # 第一次等10秒，第二次等15秒...
+                st.toast(f"⚠️ 触发限流，正在冷却 {wait_time} 秒后重试...", icon="⏳")
+                time.sleep(wait_time)
+                continue # 跳回循环开头重试
+            else:
+                # 如果是其他错误 (比如图片坏了)，直接报错
+                raise e
+    
+    raise Exception("重试多次失败，请检查账户余额或网络。")
 
-# 用于下载生成的图片以便打包
 def download_image(url):
     response = requests.get(url)
     return response.content
 
-# --- 第一部分：参考图风格分析 ---
-st.header("1️⃣ 参考风格提取 (Style Extraction)")
-col1, col2 = st.columns([1, 2])
+# --- 1. 参考风格 ---
+st.header("1️⃣ 参考风格提取")
+ref_file = st.file_uploader("上传风格参考图", type=['png', 'jpg', 'jpeg'], key="ref")
 
-with col1:
-    ref_file = st.file_uploader("上传一张风格参考图", type=['png', 'jpg', 'jpeg'], key="ref")
+if ref_file and api_token:
+    st.image(ref_file, width=200)
+    if st.button("🔍 分析风格"):
+        with st.spinner("正在分析..."):
+            try:
+                output = run_replicate_safe(
+                    "pharmapsychotic/clip-interrogator:8151e1c9f47e696fa316146a2e35812ccf79cfc9eba05b11c7f450155102af70",
+                    {"image": ref_file, "mode": "fast"},
+                    api_token
+                )
+                st.session_state['style_tags'] = output
+                st.success("分析完成！")
+            except Exception as e:
+                st.error(f"分析失败: {e}")
 
-if ref_file:
-    with col1:
-        st.image(ref_file, caption="参考图", use_container_width=True)
-
-    with col2:
-        if api_token:
-            if st.button("🔍 分析风格提示词"):
-                with st.spinner("正在使用 CLIP 模型分析画面风格..."):
-                    try:
-                        # 使用 CLIP Interrogator 分析风格
-                        output = run_replicate(
-                            "pharmapsychotic/clip-interrogator:8151e1c9f47e696fa316146a2e35812ccf79cfc9eba05b11c7f450155102af70",
-                            {"image": ref_file, "mode": "fast"},
-                            api_token
-                        )
-                        st.session_state['style_tags'] = output
-                        st.success("风格提取完成！")
-                    except Exception as e:
-                        st.error(f"分析失败: {e}")
-            
-            # 允许用户编辑风格词
-            style_prompt = st.text_area(
-                "风格提示词 (Style Prompts)", 
-                value=st.session_state.get('style_tags', ""),
-                height=150,
-                placeholder="此处将显示AI分析出的风格关键词，例如: oil painting, cyberpunk, lighting..."
-            )
+if 'style_tags' in st.session_state:
+    style_prompt = st.text_area("风格提示词", st.session_state['style_tags'], height=100)
 else:
     style_prompt = ""
 
 st.markdown("---")
 
-# --- 第二部分：批量内容分析与生成 ---
-st.header("2️⃣ 批量融合与生成 (Batch Processing)")
-batch_files = st.file_uploader("上传需要处理的批量图片", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'], key="batch")
+# --- 2. 批量处理 ---
+st.header("2️⃣ 批量生成 (智能队列)")
+batch_files = st.file_uploader("上传批量图片", accept_multiple_files=True, key="batch")
 
-# 只有当所有条件具备时才显示开始按钮
 if batch_files and style_prompt and api_token:
-    
-    start_btn = st.button(f"🚀 开始全流程处理 ({len(batch_files)} 张图片)")
-    
-    if start_btn:
-        # 初始化存储，用于打包下载
+    if st.button(f"🚀 开始智能处理 ({len(batch_files)} 张)"):
+        
         zip_buffer = io.BytesIO()
-        generated_files_count = 0
+        generated_count = 0
         
         progress_bar = st.progress(0)
-        status_area = st.empty()
-        results_container = st.container()
+        status_text = st.empty()
+        results_col = st.container()
 
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             
             for idx, img_file in enumerate(batch_files):
-                current_step_str = f"[{idx+1}/{len(batch_files)}] {img_file.name}"
-                
-                # --- 阶段 A: 分析当前图片的内容 ---
-                status_area.info(f"👁️ 正在识别内容: {current_step_str} ...")
-                content_desc = ""
+                # -------------------------------------------------
+                # 步骤 A: 分析内容
+                # -------------------------------------------------
+                status_text.info(f"[{idx+1}/{len(batch_files)}] 👁️ 正在识别内容: {img_file.name}")
                 try:
-                    # 使用 BLIP 模型快速识别图片内容 (例如: "a cat sitting on a table")
-                    content_output = run_replicate(
+                    content_output = run_replicate_safe(
                         "salesforce/blip:2e1dddc8621f72155f24cf2e0adbde548458d3cab9f00c0139eea840d0ac4746",
                         {"image": img_file, "task": "image_captioning"},
                         api_token
                     )
-                    # 清理输出，加上 caption: 前缀
                     content_desc = content_output.strip()
                 except Exception as e:
-                    st.warning(f"内容识别失败，将仅使用风格词。错误: {e}")
-                    content_desc = "original image content"
-
-                # --- 阶段 B: 提示词融合 ---
-                # 逻辑：风格词 + 内容描述
-                final_combined_prompt = f"{style_prompt}, {content_desc}, high quality, 8k"
+                    st.warning(f"内容识别跳过: {e}")
+                    content_desc = "image"
                 
-                # --- 阶段 C: 生成图片 ---
-                status_area.info(f"🎨 正在绘图: {current_step_str} (内容: {content_desc}) ...")
-                
+                # -------------------------------------------------
+                # 步骤 B: 生成图片
+                # -------------------------------------------------
+                status_text.info(f"[{idx+1}/{len(batch_files)}] 🎨 正在绘制风格: {img_file.name}")
                 try:
-                    # 使用 SDXL-Lightning 快速生成
-                    output_urls = run_replicate(
+                    final_prompt = f"{style_prompt}, {content_desc}, high quality, 8k"
+                    output_urls = run_replicate_safe(
                         "bytedance/sdxl-lightning-4step:727e49a643e999d602a896c774a0158e63aa74b62784b8d42055368a28ecbd9f",
                         {
                             "image": img_file,
-                            "prompt": final_combined_prompt,
+                            "prompt": final_prompt,
                             "prompt_strength": 1.0 - strength, 
                             "num_inference_steps": 4,
                             "guidance_scale": 0
@@ -131,48 +127,33 @@ if batch_files and style_prompt and api_token:
                         api_token
                     )
                     
-                    result_url = output_urls[0]
-                    
-                    # --- 阶段 D: 展示与存入ZIP ---
-                    img_data = download_image(result_url)
-                    # 将图片写入内存中的ZIP
+                    # 保存
+                    img_data = download_image(output_urls[0])
                     zip_file.writestr(f"AI_{img_file.name}", img_data)
-                    generated_files_count += 1
+                    generated_count += 1
                     
-                    # 在界面上展示
-                    with results_container:
-                        c1, c2, c3 = st.columns([1, 1, 2])
-                        c1.image(img_file, caption="原图", width=150)
-                        c2.image(result_url, caption="AI生成", width=150)
-                        with c3:
-                            st.markdown(f"**原图内容识别:** `{content_desc}`")
-                            st.markdown(f"**融合提示词:** `{final_combined_prompt[:100]}...`")
+                    with results_col:
+                        c1, c2 = st.columns(2)
+                        c1.image(img_file, width=150, caption="原图")
+                        c2.image(output_urls[0], width=150, caption="AI生成")
                         st.divider()
 
                 except Exception as e:
-                    st.error(f"处理 {img_file.name} 失败: {e}")
-                
+                    st.error(f"❌ 生成失败 {img_file.name}: {e}")
+
                 # 更新进度
                 progress_bar.progress((idx + 1) / len(batch_files))
-                
-                # --- 防封号等待机制 ---
-                if idx < len(batch_files) - 1:
-                    for i in range(5, 0, -1):
-                        status_area.warning(f"☕ 冷却中 (避免接口拥堵): {i}s ...")
-                        time.sleep(1)
 
-        status_area.success("✅ 所有任务完成！")
+        status_text.success("✅ 全部任务处理完毕！")
         
-        # --- 批量下载按钮 ---
-        if generated_files_count > 0:
-            st.markdown("### 📥 下载中心")
+        if generated_count > 0:
             st.download_button(
-                label=f"📦 一键下载所有结果 (ZIP包)",
+                "📦 下载全部结果 (ZIP)",
                 data=zip_buffer.getvalue(),
-                file_name="ai_generated_images.zip",
+                file_name="ai_style_transfer.zip",
                 mime="application/zip",
-                use_container_width=True
+                type="primary"
             )
 
 elif not api_token:
-    st.info("👈 请在左侧输入 API Token 开始使用")
+    st.info("👈 请输入 Token")
